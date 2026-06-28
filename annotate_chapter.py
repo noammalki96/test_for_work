@@ -5,9 +5,10 @@ import argparse
 import json
 import re
 import sys
-import time # ודאי שהשורה הזו נמצאת למעלה יחד עם שאר ה-imports
+import time  
 import os
-from concurrent.futures import ThreadPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from call_llm import call_llm, APPROVED_MODELS
 from chunk_latex import chunk_document
@@ -20,24 +21,23 @@ from chunk_latex import chunk_document
 # MODEL=... sweep in the README.)
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
+
 # ==============================================================================
 # --- Prompts Templates ---
 # ==============================================================================
 def group_and_merge_chunks(chunks, max_chars=5000):
-    """מקבצת צאנקים מאותו סוג ומאחדת אותם לבלוקים של עד 5000 תווים. מסננת לחלוטין טקסט חופשי."""
     groups = {}
-    ignored_free_text_count = 0  # מונה שנוסיף בשביל הלוגים
-    
+    ignored_free_text_count = 0  
+
     for chunk in chunks:
         match = re.match(r'^\s*\\begin\{([a-zA-Z]+)\*?\}', chunk)
         env_type = match.group(1).lower() if match else 'free_text'
-        
-        # איחוד סוגים במאמרים
-        if env_type in ['proposition', 'claim', 'conjecture']: 
+
+       
+        if env_type in ['proposition', 'claim', 'conjecture']:
             env_type = 'theorem'
-        
-            
-        if env_type not in groups: 
+
+        if env_type not in groups:
             groups[env_type] = []
         groups[env_type].append(chunk)
 
@@ -54,20 +54,19 @@ def group_and_merge_chunks(chunks, max_chars=5000):
                 current_batch += "\n\n" + chunk
         if current_batch:
             final_batches.append({'env_type': env_type, 'text': current_batch})
-            
+
     return final_batches
 
+
 def build_grouped_prompt(env_type, combined_text):
-    """בניית פרומפט מיוחד המנחה את המודל לטפל בכמה צמתים מאותו סוג."""
-    # כאן תוכלי להכניס את הדוגמאות הספציפיות לכל סוג
     prompt = f"""You are analyzing a block containing multiple mathematical objects of type '{env_type}'.
-    
+
     IMPORTANT INSTRUCTION:
     1. Extract a SEPARATE node for EACH original environment found in the text.
     2. Follow ID naming rules: <type_letter><number>_<slug>.
-    
+
     {COMMON_INSTRUCTIONS}
-    
+
     Here is the combined text:
     {combined_text}
     """
@@ -75,31 +74,35 @@ def build_grouped_prompt(env_type, combined_text):
 
 
 def process_single_batch(batch, model):
-    """פונקציית עזר לעיבוד באצ' בודד במקביל, כוללת מנגנון המתנה לטעינת השרת."""
     prompt = build_grouped_prompt(batch['env_type'], batch['text'])
 
     max_retries = 5
+    base_delay = 2  # Start with a shorter 2-second delay
+
     for attempt in range(max_retries):
         try:
             response = call_llm(
                 prompt,
                 model=model,
-                system_prompt="You are a precise mathematical knowledge extraction system. Output ONLY valid JSON containing a 'nodes' list.",
+                system_prompt="You are a precise mathematical knowledge extraction system. First, use <think> or <scratchpad> tags to briefly analyze the text, identify the entities, and map their relationships. Then, outside of those tags, output ONLY valid JSON containing a 'nodes' list.",
                 max_tokens=3500,
                 temperature=0.0,
             )
             result = extract_json_from_response(response)
             return result.get("nodes", []) if result else []
-            
+
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"  [Attempt {attempt+1}/{max_retries}] Server not ready or failed ({e}). Waiting 30 seconds...")
-                time.sleep(30)
+                sleep_time = base_delay * (2 ** attempt)  # Exponential backoff minimizes unnecessary idle time
+                print(
+                    f"  [Attempt {attempt + 1}/{max_retries}] Server not ready or failed ({e}). Waiting {sleep_time} seconds...")
+                time.sleep(sleep_time)
             else:
                 print(f"  Failed after {max_retries} attempts.")
                 raise e
 
-# הוראות בסיס שרלוונטיות לכל סוגי הצאנקים
+
+
 COMMON_INSTRUCTIONS = r"""
 Return ONLY valid JSON with this structure (DO NOT extract edges):
 {
@@ -125,7 +128,7 @@ Other Node Rules:
 - "proof_strategy": 1-3 short tags (for proofs).
 """
 
-# תבנית לצאנק של טקסט חופשי (מחוץ לבלוק רשמי)
+
 FREE_TEXT_PROMPT = r"""You are a mathematical knowledge extraction system. 
 You are analyzing free text from a mathematical textbook or paper. 
 Often, definitions or informal claims are hidden in the text (e.g., "We define the singular value as...").
@@ -136,23 +139,18 @@ Carefully read the text. If you find an implicit mathematical object, extract it
 
 
 def build_node_extraction_prompt(chunk):
-    """
-    בוחרת את הפרומפט המתאים לפי תוכן הצאנק: 
-    הפרדה מוחלטת לכל סוג של סביבה בעזרת משפטי תנאי.
-    """
 
     # Regex that checks if the chunk starts with a formal math environment
     match = re.match(r'^\s*\\begin\{([a-zA-Z]+)\*?\}', chunk)
-    
+
     if match:
         env_type = match.group(1).lower()
-        
-        # במאמרים ייתכנו סוגים אלו, המערכת שלכם מתייחסת אליהם כאל Theorem
+
+
         if env_type in ['proposition', 'claim', 'conjecture']:
             env_type = 'theorem'
-            
-        # --- הפרדה מוחלטת של הפרומפטים לפי סוג ---
-        
+
+
         if env_type == "definition":
             specific_prompt = r"""You are a mathematical knowledge extraction system.
 You are extracting a mathematical DEFINITION from a formal LaTeX block. Here some examples you should study:
@@ -199,7 +197,7 @@ Example 2 output jason: {
 
 """
             return specific_prompt + COMMON_INSTRUCTIONS + "\n\nHere is the formal LaTeX block:\n" + chunk
-            
+
         elif env_type == "theorem":
             specific_prompt = r"""You are a mathematical knowledge extraction system.
 You are extracting a mathematical THEOREM from a formal LaTeX block. Here some examples you should study from:
@@ -247,7 +245,7 @@ Example 2 output jason: {
 
 """
             return specific_prompt + COMMON_INSTRUCTIONS + "\n\nHere is the formal LaTeX block:\n" + chunk
-            
+
         elif env_type == "lemma":
             specific_prompt = r"""You are a mathematical knowledge extraction system.
 You are extracting a mathematical LEMMA from a formal LaTeX block. Here some examples you should study from :
@@ -294,7 +292,7 @@ Example 2 output jason : {
     }
 """
             return specific_prompt + COMMON_INSTRUCTIONS + "\n\nHere is the formal LaTeX block:\n" + chunk
-            
+
         elif env_type == "corollary":
             specific_prompt = r"""You are a mathematical knowledge extraction system.
 You are extracting a mathematical COROLLARY from a formal LaTeX block. Here some examples you should study from :
@@ -335,7 +333,7 @@ Example 2 output jason : {
     }
 """
             return specific_prompt + COMMON_INSTRUCTIONS + "\n\nHere is the formal LaTeX block:\n" + chunk
-            
+
         elif env_type == "proof":
             specific_prompt = r"""You are a mathematical knowledge extraction system.
 You are extracting a mathematical PROOF from a formal LaTeX block. Here some examples you should study from :
@@ -372,12 +370,8 @@ Example 2 output jason : {
     }
 """
             return specific_prompt + COMMON_INSTRUCTIONS + "\n\nHere is the formal LaTeX block:\n" + chunk
-            
 
-    # גיבוי - אם סוג הסביבה אינו באחד התנאים או שמדובר בטקסט חופשי באמת
     return FREE_TEXT_PROMPT + "\n\nHere is the free LaTeX text:\n" + chunk
-
-
 
 
 EDGE_EXTRACTION_PROMPT = r"""You are a precise mathematical knowledge extraction system.
@@ -409,10 +403,10 @@ def read_latex(path):
 
 
 def extract_json_from_response(response):
-    """Extract JSON object from LLM response (handles markdown blocks, thinking tags)."""
-    # Strip <think>...</think> tags (Qwen3 reasoning), including unclosed tags
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-    response = re.sub(r'<think>.*', '', response, flags=re.DOTALL).strip()
+    """Extract JSON object from LLM response (handles markdown blocks, reasoning tags)."""
+    # Strip both <think> and <scratchpad> tags, including unclosed tags
+    response = re.sub(r'<(think|scratchpad)>.*?</\1>', '', response, flags=re.DOTALL).strip()
+    response = re.sub(r'<(think|scratchpad)>.*', '', response, flags=re.DOTALL).strip()
 
     # Try to find JSON in markdown code block
     match = re.search(r'```(?:json)?\s*\n?(.*?)```', response, re.DOTALL)
@@ -433,113 +427,108 @@ def extract_json_from_response(response):
     except json.JSONDecodeError:
         return None
 
+
 def is_time_running_out(start_time, time_limit_seconds=450):
-    """
-    בודקת כמה זמן עבר מתחילת הריצה לעומת מגבלת הזמן.
-    מחזירה True אם נותר מעט זמן וצריך לעצור קריאות ל-LLM.
-    """
     elapsed = time.time() - start_time
     return elapsed > time_limit_seconds
-    
-
-def extract_assumptions_heuristically(latex_body):
-    """
-    Scans a LaTeX block to find sentences or major clauses that define mathematical
-    assumptions using keywords like 'assume', 'suppose', 'let', or 'if'.
-    """
-    # Remove out outer \begin{...} and \end{...} tags to focus purely on content
-    content = re.sub(r'\\begin\{[^}]+\}(?:\[.*?\])?', '', latex_body)
-    content = re.sub(r'\\end\{[^}]+\}', '', content)
-    
-    # Clean up whitespace and line breaks for linear text parsing
-    content_flat = re.sub(r'\s+', ' ', content).strip()
-    
-    # Split text into candidate sentences/clauses by punctuation (. ; :) 
-    # Lookarounds prevent breaking on decimal points (e.g., 5.10)
-    clauses = re.split(r'(?<!\d)\.(?!\d)|;|:', content_flat)
-    
-    # Regex pattern capturing variations: assume, assuming, suppose, let, if
-    assumption_keywords = re.compile(r'\b(assum|suppos|let|if)\b', re.IGNORECASE)
-    
-    extracted_assumptions = []
-    
-    for clause in clauses:
-        clause = clause.strip()
-        if not clause:
-            continue
-            
-        # Check if the clause contains any assumption anchor words
-        if assumption_keywords.search(clause):
-            # Clean out any leftover internal \label{...} definitions
-            cleaned_clause = re.sub(r'\\label\{[^}]+\}', '', clause).strip()
-            if cleaned_clause:
-                extracted_assumptions.append(cleaned_clause)
-                
-    return extracted_assumptions    
 
 
 def extract_node_deterministically(chunk, env_type, node_counter):
-    """
-    מחלצת צומת מסביבת LaTeX רשמית בעזרת חוקיות טקסט וללא קריאה למודל שפה.
-    """
+
     type_letters = {"definition": "D", "theorem": "T", "lemma": "L",
                     "corollary": "C", "proof": "P", "algorithm": "A"}
     letter = type_letters.get(env_type, "T")
 
-    # 1. מציאת המספר (מתוך label אם קיים)
+  
     label_match = re.search(r'\\label\{([^}]+)\}', chunk)
     number_part = str(node_counter)
     if label_match:
+
         num_match = re.search(r'(\d+(?:\.\d+)+)', label_match.group(1))
         if num_match:
             number_part = num_match.group(1)
 
-    # 2. מציאת שם האובייקט 
+
     name_match = re.search(r'\\begin\{[a-zA-Z]+\*?\}\s*\[(.*?)\]', chunk)
     name = name_match.group(1).strip() if name_match else None
 
-    # 3. מציאת התוכן נטו
     content_match = re.search(r'\\begin\{[a-zA-Z]+\*?\}(?:\s*\[.*?\])?(.*)\\end\{[a-zA-Z]+\*?\}', chunk, re.DOTALL)
     raw_content = content_match.group(1).strip() if content_match else chunk
+
 
     statement = re.sub(r'\\label\{[^}]+\}', '', raw_content)
     statement = re.sub(r'\s+', ' ', statement).strip()
 
+
     slug_source = name if name else statement[:40]
     slug_words = re.findall(r'[a-zA-Z]+', slug_source.lower())
+
     slug = "_".join(w for w in slug_words if len(w) > 2)[:3]
     if not slug:
         slug = "obj"
 
     node_id = f"{letter}{number_part}_{slug}"
 
-    # 4. הרכבת הצומת במבנה ה-JSON התקני
+
     node = {
         "id": node_id,
         "type": env_type,
         "name": name,
-        "section": None,  # יושלם בהמשך ע"י סורק הסעיפים
-        "statement": statement[:1500]
+        "section": None,
+        "statement": statement[:1500]  
     }
 
-    # הפעלת פונקציית העזר החדשה עבור סביבות מתמטיות מבניות
+
     if env_type in ["theorem", "lemma", "corollary"]:
-        # קריאה לפונקציית העזר כדי לחלץ הנחות בצורה דטרמיניסטית
-        node["assumptions"] = extract_assumptions_heuristically(chunk)
+        node["assumptions"] = []
         node["conclusions"] = [statement[:500]]
     elif env_type == "proof":
-        node["proves"] = ""  
+        node["proves"] = ""
         node["proof_strategy"] = ["direct proof"]
 
     return node
 
 
+def process_single_edge_window(window, model, window_index, total_windows):
+    """Helper function to isolate the LLM call for ThreadPoolExecutor."""
+    catalog_lines = []
+    for n in window:
+        name_str = f" ({n.get('name')})" if n.get('name') else ""
+        stmt = n.get('statement', '')[:150].replace('\n', ' ')
+        catalog_lines.append(f"ID: {n['id']} | Type: {n['type']}{name_str} | Statement: {stmt}")
+
+    catalog_text = "\n".join(catalog_lines)
+    edge_prompt = EDGE_EXTRACTION_PROMPT + "\n\nHere are the nodes for this batch:\n" + catalog_text
+
+    print(f"    Calling LLM for edges window {window_index + 1}/{total_windows}...")
+    try:
+        edge_response = call_llm(
+            edge_prompt,
+            model=model,
+            system_prompt="You are a precise mathematical knowledge extraction system. Output ONLY valid JSON with an 'edges' list.",
+            max_tokens=1000,
+            temperature=0.0,
+        )
+        edge_result = extract_json_from_response(edge_response)
+
+        if edge_result and "edges" in edge_result:
+            new_edges = edge_result["edges"]
+            print(f"      Found {len(new_edges)} edges in window {window_index + 1}.")
+            return new_edges
+        else:
+            print(f"      ERROR: Could not parse edges from LLM response for window {window_index + 1}.")
+            return []
+
+    except Exception as e:
+        print(f"    [CRITICAL ERROR] LLM failed on edge window {window_index + 1}: {e}")
+        return []
+
+
 def extract_edges_in_windows(nodes_list, start_time, time_limit_seconds, model, skip_first_n_windows=0):
-    """פונקציית עזר המריצה חילוץ קשתות בחלונות גולשים עם טקסט משוטח לחיסכון בטוקנים."""
     master_edges = []
     if not nodes_list:
         return [], 0
-        
+
     window_size = 35
     step = 20
     windows = []
@@ -547,58 +536,44 @@ def extract_edges_in_windows(nodes_list, start_time, time_limit_seconds, model, 
         windows.append(nodes_list[i:i + window_size])
         if i + window_size >= len(nodes_list):
             break
-            
+
     print(f"    Total overlapping windows for these {len(nodes_list)} nodes: {len(windows)}.")
 
+    # Filter out skipped windows and check timeouts before queuing
+    windows_to_process = []
     for i, window in enumerate(windows):
         if i < skip_first_n_windows:
-            print(f"    Skipping window {i+1} (already processed).")
-            continue 
-            
-        if is_time_running_out(start_time, time_limit_seconds): 
+            print(f"    Skipping window {i + 1} (already processed).")
+            continue
+
+        if is_time_running_out(start_time, time_limit_seconds):
             print("    [TIMEOUT WARNING] Time is running out! Stopping edge extraction.")
             break
-            
-        # --- השינוי המרכזי: שיטוח הצמתים לשורות טקסט פשוטות במקום JSON ---
-        catalog_lines = []
-        for n in window:
-            name_str = f" ({n.get('name')})" if n.get('name') else ""
-            # ניקח רק את 150 התווים הראשונים של המשפט כדי למנוע עומס
-            stmt = n.get('statement', '')[:150].replace('\n', ' ')
-            catalog_lines.append(f"ID: {n['id']} | Type: {n['type']}{name_str} | Statement: {stmt}")
-            
-        catalog_text = "\n".join(catalog_lines)
-        edge_prompt = EDGE_EXTRACTION_PROMPT + "\n\nHere are the nodes for this batch:\n" + catalog_text
 
-        print(f"    Calling LLM for edges window {i+1}/{len(windows)}...")
-        try:
-            edge_response = call_llm(
-                edge_prompt,
-                model=model,
-                system_prompt="You are a precise mathematical knowledge extraction system. Output ONLY valid JSON with an 'edges' list.",
-                max_tokens=1000, # הקטנתי את המקסימום כדי להאיץ את המודל
-                temperature=0.0,
-            )
-            edge_result = extract_json_from_response(edge_response)
-            
-            if edge_result and "edges" in edge_result:
-                new_edges = edge_result["edges"]
-                master_edges.extend(new_edges)
-                print(f"      Found {len(new_edges)} edges in window {i+1}.")
-            else:
-                print(f"      ERROR: Could not parse edges from LLM response for window {i+1}.")
-                # הדפסת התשובה הגולמית של המודל כדי שנוכל לדבג אם זה קורה שוב!
-                print(f"      [DEBUG] Raw LLM response: {edge_response[:200]}...")
-        except Exception as e:
-            print(f"    [CRITICAL ERROR] LLM failed on edge window {i+1}: {e}")
-            
-    return master_edges, len(windows)
+        windows_to_process.append((i, window))
+
+    if not windows_to_process:
+        return master_edges, len(windows)
+
+    # Execute concurrent LLM calls
+    total_windows = len(windows)
+    max_workers = min(8, len(windows_to_process))  # Adjust max_workers based on your vLLM concurrency limits
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_edge_window, window, model, i, total_windows)
+            for i, window in windows_to_process
+        ]
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                master_edges.extend(result)
+
+    return master_edges, total_windows
 
 def annotate_chapter(latex_path, model=DEFAULT_MODEL):
-    """
-    פונקציית הניהול הראשית לחילוץ מדורג (Nodes -> Edges -> More Nodes -> More Edges).
-    עודכנה כדי להפיק פורמט פלט תואם לחלוטין ל-Chapter3_gold.json כולל מטא-דאטה.
-    """
+
     start_time = time.time()
 
     latex = read_latex(latex_path)
@@ -613,21 +588,21 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
     # ==========================================
     # Extract Metadata Deterministically 
     # ==========================================
-    # מציאת כותרת הפרק מתוך \chapter{...} או \title{...} או ברירת מחדל לפסקה הראשונה
+
     title_match = re.search(r'\\(?:chapter|title)\*?\{([^}]+)\}', latex)
     chapter_title = title_match.group(1).strip() if title_match else "Ch. 5: Machine Learning"
     
-    # איסוף אוטומטי של כל מספרי הסעיפים כדי לקבוע את טווח הסעיפים (למשל 5.1-5.11)
+
     section_numbers = re.findall(r'\\section\*?\{([\d.]+)', latex)
     if section_numbers:
-        # סינון כפילויות ושמירה על סדר
+
         unique_sections = sorted(list(set(section_numbers)), key=float)
         sections_range = f"{unique_sections[0]}-{unique_sections[-1]}"
     else:
-        sections_range = "5.1-5.11" # ערך ברירת מחדל בטוח עבור פרק 5
+        sections_range = "5.1-5.11" 
 
     # ==========================================
-    # Phase 1A: חילוץ צמתים דטרמיניסטי (מיידי)
+    # Phase 1A: 
     # ==========================================
     for chunk in chunks:
         match = re.match(r'^\s*\\begin\{([a-zA-Z]+)\*?\}', chunk)
@@ -643,7 +618,7 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
         else:
             free_text_chunks.append(chunk)
 
-    # סינון כפילויות ראשוני
+
     seen_ids = set()
     det_nodes = []
     for node in master_nodes:
@@ -654,7 +629,7 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
     print(f"  Phase 1A: Extracted {len(det_nodes)} nodes deterministically.")
 
     # ==========================================
-    # Phase 2A: חילוץ קשתות *רק* לצמתים הדטרמיניסטיים
+    # Phase 2A: 
     # ==========================================
     print("  --- PHASE 2A: Extracting Edges for Deterministic Nodes ---")
     det_edges, processed_windows_count = extract_edges_in_windows(
@@ -662,37 +637,40 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
     )
 
     # ==========================================
-    # Phase 1B: חילוץ צמתים נוספים מטקסט חופשי (LLM)
+    # Phase 1B: Concurrent Free Text Extraction
     # ==========================================
     print("  --- PHASE 1B: Extracting Nodes from Free Text ---")
     batches = group_and_merge_chunks(free_text_chunks)
 
-    for i, batch in enumerate(batches):
-        if is_time_running_out(start_time, time_limit_seconds=420):  # עוצרים ב-7 דקות
+    # Pre-filter batches to respect timeouts before submitting to the thread pool
+    batches_to_process = []
+    for batch in batches:
+        if is_time_running_out(start_time, time_limit_seconds=420):
             print("  [TIMEOUT WARNING] Time is running out! Skipping remaining free text extraction.")
             break
+        batches_to_process.append(batch)
 
-        try:
-            nodes = process_single_batch(batch, model)
-            master_nodes.extend(nodes)
-            print(f"  Finished LLM batch {i + 1}/{len(batches)}. Added {len(nodes)} nodes.")
-        except Exception as e:
-            print(f"  [CRITICAL ERROR] LLM connection failed on batch {i + 1}: {e}")
-            break
+    if batches_to_process:
+        # Match this max_workers logic to what we discussed for your vLLM sequence limits
+        max_workers = min(8, len(batches_to_process))
 
-    # סינון כללי כדי לאחד הכל יחד
-    final_nodes = []
-    seen_ids = set()
-    for node in master_nodes:
-        if node.get("id") and node["id"] not in seen_ids:
-            final_nodes.append(node)
-            seen_ids.add(node["id"])
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(process_single_batch, batch, model): i
+                for i, batch in enumerate(batches_to_process)
+            }
 
-    llm_added_count = len(final_nodes) - len(det_nodes)
-    print(f"  Phase 1B Finished. Added {llm_added_count} free text nodes. Total nodes: {len(final_nodes)}.")
+            for future in as_completed(future_to_index):
+                batch_index = future_to_index[future]
+                try:
+                    nodes = future.result()
+                    master_nodes.extend(nodes)
+                    print(f"  Finished LLM batch {batch_index + 1}/{len(batches)}. Added {len(nodes)} nodes.")
+                except Exception as e:
+                    print(f"  [CRITICAL ERROR] LLM connection failed on batch {batch_index + 1}: {e}")
 
     # ==========================================
-    # Phase 2B: השלמת קשתות לצמתים החדשים (במידה ונשאר זמן)
+    # Phase 2B:
     # ==========================================
     llm_edges = []
     if llm_added_count > 0 and not is_time_running_out(start_time, time_limit_seconds=510):
@@ -705,7 +683,7 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
         print("  [SKIP] Not enough time (or no new nodes) for Phase 2B. Moving to finish.")
 
     # ==========================================
-    # איחוד וניקוי קשתות סופי
+    # 
     # ==========================================
     all_edges = det_edges + llm_edges
     unique_edges = []
@@ -719,7 +697,7 @@ def annotate_chapter(latex_path, model=DEFAULT_MODEL):
 
     print(f"  Final Phase complete. Total unique edges extracted: {len(unique_edges)}.")
 
-    # הרכבת המילון הסופי במבנה המדויק של קובץ הזהב (Gold Standard JSON)
+
     return {
         "metadata": {
             "title": chapter_title,
@@ -755,6 +733,7 @@ def main():
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print(f"Output written to: {args.output}")
+
 
 if __name__ == "__main__":
     main()
